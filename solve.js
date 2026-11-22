@@ -412,11 +412,11 @@ function truthy(v) {
 }
 
 /**
- * Compile a parsed template into a function(S, T, D, lk, pv, hv, esc, textOf, truthy)
+ * Compile a parsed template into a function(S, T, D, lk, pv, hv, esc, textOf, truthy, M, memoGet, memoSet)
  * returning its rendered string. S is the scope stack (root vars at [0], loop
  * scopes pushed on top); T maps template names to their compiled functions;
- * D is the include depth. Output accumulates in one string (_s += ...), which
- * beats an array + join for this append-heavy code.
+ * D is the include depth; M is the per-case include memo. Output accumulates
+ * in one string (_s += ...), which beats an array + join for this append-heavy code.
  * A path's first name bound by a loop in this same template becomes a JS
  * local; a root name (site, tags, recent, page, posts, pager, tag — never a
  * loop variable in this generator's templates) reads straight from S[0];
@@ -424,6 +424,110 @@ function truthy(v) {
  * reference's lookup does (nearest scope first, then own properties).
  */
 const ROOT_NAMES = new Set(['site', 'tags', 'recent', 'page', 'posts', 'pager', 'tag']);
+
+/** The root values, identical for every render in a case: memoizing a template that reads only these is one render. */
+const STABLE_ROOTS = new Set(['site', 'tags', 'recent']);
+
+/**
+ * A template's direct free reads: the first segments its own nodes look up
+ * outside its own loops, and the names it includes directly. A name bound by
+ * an enclosing loop inside this template is not free (its value derives from
+ * the loop's iterable, which is read free).
+ */
+function directReads(nodes) {
+  const reads = new Set();
+  const includes = [];
+  function walk(ns, bound) {
+    for (const n of ns) {
+      if (n.kind === 'var' || n.kind === 'raw' || n.kind === 'if' || n.kind === 'for') {
+        if (!bound.has(n.path[0])) reads.add(n.path[0]);
+      }
+      if (n.kind === 'for') {
+        const b2 = new Set(bound);
+        b2.add(n.name);
+        b2.add('loop');
+        walk(n.body, b2);
+      } else if (n.kind === 'if') {
+        walk(n.then, bound);
+        if (n.else !== null) walk(n.else, bound);
+      } else if (n.kind === 'include') includes.push(n.name);
+    }
+  }
+  walk(nodes, new Set());
+  return { reads, includes };
+}
+
+/**
+ * Every first segment a template may look up in the scope it is rendered in:
+ * its direct free reads plus those of every template it includes, transitively.
+ * Site-independent (a name bound by a loop at an include site resolves there,
+ * so it belongs in the key), hence a pure function of the template graph.
+ */
+function computeReads(name, asts, cache) {
+  const hit = cache.get(name);
+  if (hit !== undefined) return hit;
+  const out = new Set();
+  const stack = [name];
+  const seen = new Set([name]);
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    const nodes = asts.get(cur);
+    if (nodes === undefined) continue;
+    const { reads, includes } = directReads(nodes);
+    for (const r of reads) out.add(r);
+    for (const inc of includes) {
+      if (!seen.has(inc)) { seen.add(inc); stack.push(inc); }
+    }
+  }
+  const arr = [...out];
+  cache.set(name, arr);
+  return arr;
+}
+
+/** The names included from inside a `for` body anywhere in `asts`. */
+function includedInLoop(asts) {
+  const out = new Set();
+  function walk(ns, inLoop) {
+    for (const n of ns) {
+      if (n.kind === 'include' && inLoop) out.add(n.name);
+      else if (n.kind === 'for') walk(n.body, true);
+      else if (n.kind === 'if') {
+        walk(n.then, inLoop);
+        if (n.else !== null) walk(n.else, inLoop);
+      }
+    }
+  }
+  for (const nodes of asts.values()) walk(nodes, false);
+  return out;
+}
+
+/**
+ * The per-case include memo, a trie keyed by [template, depth, ...values]:
+ * `memoGet` returns the stored string or undefined on a miss. Values are
+ * compared by Map identity (objects) or value (strings, numbers, booleans),
+ * which is exact here: a template's render is a pure function of the values
+ * its reads resolve to, and no value it reads is ever mutated mid-build.
+ */
+function memoGet(M, name, parts) {
+  let node = M.get(name);
+  if (node === undefined) return undefined;
+  for (let k = 0; k < parts.length; k++) {
+    node = node.get(parts[k]);
+    if (node === undefined) return undefined;
+  }
+  return node;
+}
+
+function memoSet(M, name, parts, str) {
+  let node = M.get(name);
+  if (node === undefined) { node = new Map(); M.set(name, node); }
+  for (let k = 0; k < parts.length - 1; k++) {
+    let child = node.get(parts[k]);
+    if (child === undefined) { child = new Map(); node.set(parts[k], child); }
+    node = child;
+  }
+  node.set(parts[parts.length - 1], str);
+}
 
 function hv(v, k) {
   return Object.hasOwn(v, k) ? v[k] : undefined;
@@ -449,7 +553,19 @@ function bodyUsesLoop(nodes) {
   return false;
 }
 
-function compileTemplate(nodes) {
+/**
+ * `meta` maps every template name to { reads, memoize }: the names it may
+ * look up in its render scope, and whether its includes are memoized (its
+ * reads are only the per-case stable roots, or it is included from a loop,
+ * so the same inputs recur).
+ */
+/**
+ * `rootFast` is true only when no loop variable anywhere in this case's
+ * templates is named a root name: then a root name can never be bound by an
+ * ancestor loop, so reading it straight from S[0] is exact. Otherwise every
+ * name resolves through the scope stack, exactly as the reference does.
+ */
+function compileTemplate(nodes, meta, rootFast) {
   let uid = 0;
   const lines = ['let _s=\'\';'];
   function findBinding(scope, name) {
@@ -464,7 +580,7 @@ function compileTemplate(nodes) {
     const b = findBinding(scope, path[0]);
     let e;
     if (b !== null) e = b;
-    else if (ROOT_NAMES.has(path[0])) e = `hv(S[0],${JSON.stringify(path[0])})`;
+    else if (rootFast && ROOT_NAMES.has(path[0])) e = `hv(S[0],${JSON.stringify(path[0])})`;
     else e = `lk(S,${JSON.stringify(path[0])})`;
     for (let k = 1; k < path.length; k++) e = `pv(${e},${JSON.stringify(path[k])})`;
     return e;
@@ -496,13 +612,23 @@ function compileTemplate(nodes) {
         // Three closes (for, if, block); the first } ends the ${} interpolation.
         lines.push(`${needsPush ? 'S.pop();' : ''}}}}`);
       } else if (n.kind === 'include') {
-        lines.push(`if(D<8){const _f=T[${JSON.stringify(n.name)}];if(_f!==undefined)_s+=_f(S,T,D+1,lk,pv,hv,esc,textOf,truthy);}`);
+        const info = meta.get(n.name);
+        const call = `_f(S,T,D+1,lk,pv,hv,esc,textOf,truthy,M,memoGet,memoSet)`;
+        if (info !== undefined && info.memoize) {
+          // Memoized: the render depends only on the depth and the values its
+          // reads resolve to here, so those are the key. A miss renders,
+          // stores and appends; a hit appends the stored string.
+          const keyParts = ['D', ...info.reads.map((r) => expr([r], scope))].join(',');
+          lines.push(`if(D<8){const _f=T[${JSON.stringify(n.name)}];if(_f!==undefined){const _vv=[${keyParts}];const _mm=memoGet(M,${JSON.stringify(n.name)},_vv);if(_mm!==undefined)_s+=_mm;else{const _rr=${call};memoSet(M,${JSON.stringify(n.name)},_vv,_rr);_s+=_rr;}}}`);
+        } else {
+          lines.push(`if(D<8){const _f=T[${JSON.stringify(n.name)}];if(_f!==undefined)_s+=${call};}`);
+        }
       }
     }
   }
   gen(nodes, []);
   lines.push('return _s;');
-  return new Function('S', 'T', 'D', 'lk', 'pv', 'hv', 'esc', 'textOf', 'truthy', lines.join('\n'));
+  return new Function('S', 'T', 'D', 'lk', 'pv', 'hv', 'esc', 'textOf', 'truthy', 'M', 'memoGet', 'memoSet', lines.join('\n'));
 }
 
 // ---------------------------------------------------------------- Markdown
@@ -843,16 +969,50 @@ export function run(input) {
   // plain object (null-prototyped: a template could be named "__proto__").
   const tplObj = Object.create(null);
   const report = [];
+  const asts = new Map();
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      const fn = compileTemplate(parseTemplate(name, input.templates[name]));
-      templates.set(name, fn);
-      tplObj[name] = fn;
+      asts.set(name, parseTemplate(name, input.templates[name]));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
     }
   }
+  // Include memoization, decided per template from its reads and from
+  // whether it is ever included inside a loop: a template whose reads are
+  // only the per-case stable roots renders once per case, and one included
+  // from a loop renders once per element it is given.
+  const readsCache = new Map();
+  const inLoop = includedInLoop(asts);
+  const meta = new Map();
+  for (const name of asts.keys()) {
+    const reads = computeReads(name, asts, readsCache);
+    meta.set(name, { reads, memoize: reads.every((r) => STABLE_ROOTS.has(r)) || inLoop.has(name) });
+  }
+  // The root fast path is exact only when no loop variable in this case is
+  // named a root name (a loop could otherwise shadow it from an include).
+  let rootFast = true;
+  for (const nodes of asts.values()) {
+    const stack = [nodes];
+    while (stack.length > 0) {
+      for (const n of stack.pop()) {
+        if (n.kind === 'for') {
+          if (ROOT_NAMES.has(n.name)) rootFast = false;
+          stack.push(n.body);
+        } else if (n.kind === 'if') {
+          stack.push(n.then);
+          if (n.else !== null) stack.push(n.else);
+        }
+      }
+    }
+    if (!rootFast) break;
+  }
+  for (const [name, nodes] of asts) {
+    const fn = compileTemplate(nodes, meta, rootFast);
+    templates.set(name, fn);
+    tplObj[name] = fn;
+  }
+  const memo = new Map();
 
   const base = input.site.base_url.replace(/\/+$/, '');
 
@@ -1012,7 +1172,7 @@ export function run(input) {
   const render = (name, vars) => {
     const fn = templates.get(name);
     if (fn === undefined) return null;
-    return fn([{ site, tags: allTags, recent, ...vars }], tplObj, 0, lk, pv, hv, escapeHtml, textOf, truthy);
+    return fn([{ site, tags: allTags, recent, ...vars }], tplObj, 0, lk, pv, hv, escapeHtml, textOf, truthy, memo, memoGet, memoSet);
   };
   const pageOf = (s) => ({
     ...s.card,
