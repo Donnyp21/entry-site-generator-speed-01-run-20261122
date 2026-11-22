@@ -32,23 +32,11 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 // ---------------------------------------------------------------- text
 
 const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const ESC_RE = /[&<>"']/g;
 
+/** `text` with & < > " and ' escaped (V8's replace beats a per-char loop here). */
 function escapeHtml(s) {
-  let out = '';
-  let start = 0;
-  for (let i = 0; i < s.length; i++) {
-    const cc = s.charCodeAt(i);
-    let r = null;
-    if (cc === 38) r = '&amp;';
-    else if (cc === 60) r = '&lt;';
-    else if (cc === 62) r = '&gt;';
-    else if (cc === 34) r = '&quot;';
-    else if (cc === 39) r = '&#39;';
-    else continue;
-    out += s.slice(start, i) + r;
-    start = i + 1;
-  }
-  return start === 0 ? s : out + s.slice(start);
+  return s.replace(ESC_RE, (c) => ESC[c]);
 }
 
 const SLUG_MAX = 64;
@@ -692,9 +680,20 @@ function isHR(line) {
   return true;
 }
 
-/** Whether `line` ends a paragraph: a blank line, a fence, a heading or a thematic break. */
+/**
+ * Whether `line` ends a paragraph: a blank line, a fence, a heading or a
+ * thematic break. Dispatched on the first character: only a blank line can
+ * start with a space or tab, only a fence with a backtick, only a heading
+ * with '#', only a break with '-' or '*'.
+ */
 function endsParagraph(line) {
-  return isBlankLine(line) || fenceOpen(line) !== null || headingOf(line) !== null || isHR(line);
+  if (line.length === 0) return true;
+  const c0 = line.charCodeAt(0);
+  if (c0 === 32 || c0 === 9) return isBlankLine(line);
+  if (c0 === 96) return fenceOpen(line) !== null;
+  if (c0 === 35) return headingOf(line) !== null;
+  if (c0 === 45 || c0 === 42) return isHR(line);
+  return false;
 }
 
 const CONTINUED = /^ {2,}\S/;
@@ -738,10 +737,32 @@ function renderMarkdown(src, link, slugify) {
   let excerpt = '';
   let excerptSet = false;
   let i = 0;
+  /** A list starting at `ls`, rendered; advances `i` past its lines. */
+  function takeList(ls) {
+    const items = [[ls.text]];
+    i++;
+    while (i < n) {
+      const l = lines[i];
+      const it = listItem(l, ls.ordered);
+      if (it !== null) { items.push([it]); i++; }
+      else if (CONTINUED.test(l)) { items[items.length - 1].push(trimST(l)); i++; }
+      else break;
+    }
+    const tag = ls.ordered ? 'ol' : 'ul';
+    const open = ls.ordered && ls.start !== 1 ? `<ol start="${ls.start}">` : `<${tag}>`;
+    let b = `${open}\n`;
+    for (const parts of items) b += `<li>${inline(parts.join('\n'), link)}</li>\n`;
+    b += `</${tag}>`;
+    return b;
+  }
   while (i < n) {
     const line = lines[i];
-    if (isBlankLine(line)) { i++; continue; }
-    if (line.charCodeAt(0) === 96) {
+    // Dispatch on the first character, in the reference's block order: a
+    // line can only be a fence, heading, break, quote or list when it opens
+    // on that block's marker, and only a blank line opens on a space or tab.
+    // Anything else falls through to the paragraph below.
+    const c0 = line.length === 0 ? 0 : line.charCodeAt(0);
+    if (c0 === 96) {
       const lang = fenceOpen(line);
       if (lang !== null) {
         const body = [];
@@ -756,18 +777,21 @@ function renderMarkdown(src, link, slugify) {
         blocks.push(b);
         continue;
       }
-    }
-    const heading = headingOf(line);
-    if (heading !== null) {
-      const id = uniqueSlug(slugify(heading.text), ids);
-      const html = inline(heading.text, link);
-      blocks.push(`<h${heading.depth} id="${id}">${html}</h${heading.depth}>`);
-      if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
-      i++;
-      continue;
-    }
-    if (isHR(line)) { blocks.push('<hr>'); i++; continue; }
-    if (line.charCodeAt(0) === 62) {
+    } else if (c0 === 35) {
+      const heading = headingOf(line);
+      if (heading !== null) {
+        const id = uniqueSlug(slugify(heading.text), ids);
+        const html = inline(heading.text, link);
+        blocks.push(`<h${heading.depth} id="${id}">${html}</h${heading.depth}>`);
+        if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
+        i++;
+        continue;
+      }
+    } else if (c0 === 45 || c0 === 42) {
+      if (isHR(line)) { blocks.push('<hr>'); i++; continue; }
+      const ls0 = listStart(line);
+      if (ls0 !== null) { blocks.push(takeList(ls0)); continue; }
+    } else if (c0 === 62) {
       const body = [];
       while (i < n && lines[i].charCodeAt(0) === 62) {
         const l = lines[i++];
@@ -780,25 +804,11 @@ function renderMarkdown(src, link, slugify) {
       }
       blocks.push(kept.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(kept.join('\n'), link)}</p>\n</blockquote>`);
       continue;
-    }
-    const ls = listStart(line);
-    if (ls !== null) {
-      const items = [[ls.text]];
-      i++;
-      while (i < n) {
-        const l = lines[i];
-        const it = listItem(l, ls.ordered);
-        if (it !== null) { items.push([it]); i++; }
-        else if (CONTINUED.test(l)) { items[items.length - 1].push(trimST(l)); i++; }
-        else break;
-      }
-      const tag = ls.ordered ? 'ol' : 'ul';
-      const open = ls.ordered && ls.start !== 1 ? `<ol start="${ls.start}">` : `<${tag}>`;
-      let b = `${open}\n`;
-      for (const parts of items) b += `<li>${inline(parts.join('\n'), link)}</li>\n`;
-      b += `</${tag}>`;
-      blocks.push(b);
-      continue;
+    } else if (c0 >= 48 && c0 <= 57) {
+      const ls = listStart(line);
+      if (ls !== null) { blocks.push(takeList(ls)); continue; }
+    } else if (c0 === 0 || c0 === 32 || c0 === 9) {
+      if (isBlankLine(line)) { i++; continue; }
     }
     const body = [trimST(line)];
     i++;
@@ -909,25 +919,27 @@ export function run(input) {
   // 4. Markdown, each body's links resolved to the pages and static files.
   const staticPaths = new Set(statics.map((f) => f.path));
   const broken = new Set();
+  // Only successful resolutions are cached, keyed by directory + target:
+  // a broken link is reported per source, so it must be recomputed (and
+  // reported) for every source that holds it, never served from a cache.
   const linkCache = new Map();
   for (const s of kept) {
     const dir = dirOf(s.path);
     const link = (target) => {
-      // Keyed by source path, not directory: a broken link is reported per
-      // source (`broken-link <source> -> <target>`), so two sources in one
-      // directory linking at the same missing target must each report.
-      const key = `${s.path}\n${target}`;
-      let v = linkCache.get(key);
-      if (v !== undefined) return v;
-      if (hasScheme(target) || target.startsWith('/') || target.startsWith('#')) v = target;
+      if (hasScheme(target) || target.charCodeAt(0) === 47 || target.charCodeAt(0) === 35) return target;
+      const key = `${dir}\n${target}`;
+      const hit = linkCache.get(key);
+      if (hit !== undefined) return hit;
+      const hash = target.indexOf('#');
+      const rel = hash === -1 ? target : target.slice(0, hash);
+      const frag = hash === -1 ? '' : target.slice(hash);
+      const path = rel === '' ? null : resolvePath(dir, rel);
+      let v;
+      if (path !== null && bySource.has(path)) v = `${bySource.get(path).url}${frag}`;
+      else if (path !== null && staticPaths.has(path)) v = `${base}/${path}${frag}`;
       else {
-        const hash = target.indexOf('#');
-        const rel = hash === -1 ? target : target.slice(0, hash);
-        const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dir, rel);
-        if (path !== null && bySource.has(path)) v = `${bySource.get(path).url}${frag}`;
-        else if (path !== null && staticPaths.has(path)) v = `${base}/${path}${frag}`;
-        else { broken.add(`broken-link ${s.path} -> ${target}`); v = target; }
+        broken.add(`broken-link ${s.path} -> ${target}`);
+        return target;
       }
       linkCache.set(key, v);
       return v;
